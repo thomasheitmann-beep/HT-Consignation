@@ -48,7 +48,21 @@ async function syncContactsToShared(newClients, previousClients) {
 // Dans cette app, un client peut avoir plusieurs contacts : on les regroupe par société.
 // Dans la base commune, chaque contact reste un document à plat (même format que Devis/Factures).
 const normKey = (t) => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/\s+/g, " ").trim();
-const hasContent = (x) => (x.nom || x.email || x.tel || "").trim() !== "";
+// Téléphones : liste typée [{ type: "Fixe" | "Mobile", numero }]
+const TEL_TYPES = ["Mobile", "Fixe"];
+const guessTelType = (n) => (/^(\+33\s?|0033\s?|0)[67]/.test(String(n).replace(/[\s.\-]/g, "")) ? "Mobile" : "Fixe");
+const readTels = (r) => {
+  if (Array.isArray(r.telephones)) return r.telephones.map((t) => ({ type: TEL_TYPES.includes(t?.type) ? t.type : guessTelType(t?.numero || ""), numero: String(t?.numero || "") }));
+  if (r.telephone || r.tel) return [{ type: guessTelType(r.telephone || r.tel), numero: String(r.telephone || r.tel) }]; // ancien champ texte
+  return [];
+};
+const cleanTels = (tels) => (tels || []).map((t) => ({ type: t.type, numero: t.numero.trim() })).filter((t) => t.numero);
+const telsText = (tels) => cleanTels(tels).map((t) => `${t.type} ${t.numero}`).join(" · ");
+const hasContent = (x) => !!((x.nom || "").trim() || (x.email || "").trim() || cleanTels(x.tels).length);
+
+// Champs connus : tout autre champ présent sur un document (ex. "code") est conservé tel quel
+const KNOWN = ["id", "societe", "contact", "adresse", "cp", "ville", "pays", "email", "telephones", "telephone", "tel", "fonction", "notes"];
+const extrasOf = (r) => Object.fromEntries(Object.entries(r).filter(([k]) => !KNOWN.includes(k)));
 
 function groupShared(records) {
   const groups = new Map();
@@ -60,11 +74,10 @@ function groupShared(records) {
   return [...groups.values()].map((g) => {
     g.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const f = g[0];
-    const contacts = g.map((r) => ({ id: r.id, nom: r.contact || "", fonction: r.fonction || "", email: r.email || "", tel: r.telephone || "" }));
+    const contacts = g.map((r) => ({ id: r.id, nom: r.contact || "", email: r.email || "", tels: readTels(r), _extra: extrasOf(r) }));
     const real = contacts.filter(hasContent);
     return {
-      id: f.id, nom: f.societe || "", adresse: f.adresse || "", cp: f.cp || "", ville: f.ville || "",
-      notes: g.find((r) => r.notes)?.notes || "", code: f.code || "",
+      id: f.id, nom: f.societe || "", adresse: f.adresse || "", cp: f.cp || "", ville: f.ville || "", pays: f.pays || "",
       contacts: real.length ? real : contacts.slice(0, 1),
     };
   });
@@ -72,20 +85,12 @@ function groupShared(records) {
 
 function flattenClients(clients) {
   return clients.flatMap((c) => {
-    const base = { societe: c.nom || "", adresse: c.adresse || "", cp: c.cp || "", ville: c.ville || "" };
-    if (c.code) base.code = c.code;
-    if (c.notes) base.notes = c.notes;
+    const base = { societe: c.nom || "", adresse: c.adresse || "", cp: c.cp || "", ville: c.ville || "", pays: c.pays || "" };
     const cts = c.contacts.filter(hasContent);
-    if (!cts.length) return [{ id: c.id, ...base, contact: "", email: "", telephone: "" }];
-    return cts.map((x) => {
-      const r = { id: x.id, ...base, contact: x.nom || "", email: x.email || "", telephone: x.tel || "" };
-      if (x.fonction) r.fonction = x.fonction;
-      return r;
-    });
+    if (!cts.length) return [{ ...(c.contacts[0]?._extra || {}), id: c.id, ...base, contact: "", email: "", telephones: [] }];
+    return cts.map((x) => ({ ...(x._extra || {}), id: x.id, ...base, contact: x.nom || "", email: x.email || "", telephones: cleanTels(x.tels) }));
   });
 }
-const SETTINGS_REF = () => doc(db, "ht-consignation", "parametres");
-const MAX_BYTES = 1000000; // limite Firestore ≈ 1 Mo par document
 
 const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
 const today = () => new Date().toISOString().slice(0, 10);
@@ -801,10 +806,10 @@ function PrintPDP({ d, settings }) {
 
 /* ---------------- Clients ---------------- */
 
-const newContact = () => ({ id: uid(), nom: "", fonction: "", email: "", tel: "" });
-const newClient = () => { const id = uid(); return { id, nom: "", adresse: "", cp: "", ville: "", notes: "", contacts: [{ ...newContact(), id }] }; };
+const newContact = () => ({ id: uid(), nom: "", email: "", tels: [{ type: "Mobile", numero: "" }] });
+const newClient = () => { const id = uid(); return { id, nom: "", adresse: "", cp: "", ville: "", pays: "", contacts: [{ ...newContact(), id }] }; };
 const contactFor = (clientId) => ({ ...newContact(), id: `${clientId}-${uid()}` });
-const clientAddr = (c) => [c.adresse, [c.cp, c.ville].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+const clientAddr = (c) => [c.adresse, [c.cp, c.ville].filter(Boolean).join(" "), c.pays].filter(Boolean).join(", ");
 const isEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e || "");
 
 const selCls = "w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-[15px] text-slate-900 focus:border-slate-700 focus:outline-none focus:ring-2 focus:ring-yellow-400/60";
@@ -871,8 +876,8 @@ function ClientPicker({ clients, data, setData, type, onManage, onAddClient, onA
     .map((c) => ({ id: c.id, label: c.nom || "(sans nom)", sub: clientAddr(c), extra: c.contacts.map((x) => x.nom).join(" ") }));
   // Sans client choisi, on cherche le contact dans toute la base (il amène son client avec lui)
   const contactOptions = client
-    ? client.contacts.filter(hasContent).map((x) => ({ id: x.id, clientId: client.id, label: x.nom || x.email || "(sans nom)", sub: [x.fonction, x.email, x.tel].filter(Boolean).join(" · ") }))
-    : clients.flatMap((c) => c.contacts.filter(hasContent).map((x) => ({ id: x.id, clientId: c.id, label: x.nom || x.email || "(sans nom)", sub: [c.nom, x.fonction].filter(Boolean).join(" · "), extra: x.email })));
+    ? client.contacts.filter(hasContent).map((x) => ({ id: x.id, clientId: client.id, label: x.nom || x.email || "(sans nom)", sub: [x.email, telsText(x.tels)].filter(Boolean).join(" · ") }))
+    : clients.flatMap((c) => c.contacts.filter(hasContent).map((x) => ({ id: x.id, clientId: c.id, label: x.nom || x.email || "(sans nom)", sub: [c.nom, x.email].filter(Boolean).join(" · "), extra: cleanTels(x.tels).map((t) => t.numero).join(" ") })));
 
   const fillClient = (n, c) => {
     if (type === "AC") { if (!n.adresse) n.adresse = clientAddr(c); return n; }
@@ -903,7 +908,7 @@ function ClientPicker({ clients, data, setData, type, onManage, onAddClient, onA
     setData((d) => {
       let n = { ...d, contactId: ct.id, contactNom: ct.nom, contactEmail: "" };
       if (findClient(clients, d)?.id !== c.id) n = fillClient({ ...n, clientId: c.id, clientNom: c.nom }, c);
-      return fillContact(n, ct.nom, ct.fonction || "");
+      return fillContact(n, ct.nom);
     });
   };
   const typeContact = (t) => setData((d) => fillContact({ ...d, contactNom: t, contactId: "" }, t));
@@ -920,7 +925,11 @@ function ClientPicker({ clients, data, setData, type, onManage, onAddClient, onA
           placeholder={client ? `Contacts de ${client.nom}` : "Nom, e-mail…"} empty="Aucun contact trouvé : la saisie libre sera conservée." />
 
         {contact && (
-          <p className="text-sm text-slate-600 sm:col-span-2">{[contact.fonction, contact.email, contact.tel].filter(Boolean).join(" — ") || "Aucun e-mail ni téléphone pour ce contact."}</p>
+          <div className="text-sm text-slate-600 sm:col-span-2">
+            {contact.email && <div>{contact.email}</div>}
+            {cleanTels(contact.tels).map((t, i) => <div key={i}><span className="font-semibold">{t.type}</span> {t.numero}</div>)}
+            {!contact.email && !cleanTels(contact.tels).length && "Aucun e-mail ni téléphone pour ce contact."}
+          </div>
         )}
         {manualContact && (
           <Field label="E-mail du contact (pour l'envoi)" type="email" className="sm:col-span-2" value={data.contactEmail || ""}
@@ -989,6 +998,35 @@ function ClientsPanel({ clients, docs, onOpen, onNew }) {
   );
 }
 
+// Liste de numéros typés (Fixe / Mobile), ajout et retrait libres
+function PhonesEditor({ tels, onChange }) {
+  const set = (i, k, v) => onChange(tels.map((t, j) => (j === i ? { ...t, [k]: v } : t)));
+  return (
+    <div className="mt-3">
+      <span className="mb-1 block text-[13px] font-medium text-slate-600">Téléphones</span>
+      <div className="space-y-2">
+        {tels.map((t, i) => (
+          <div key={i} className="flex gap-2">
+            <div className="flex shrink-0 overflow-hidden rounded-md border border-slate-300">
+              {TEL_TYPES.map((ty) => (
+                <button key={ty} type="button" onClick={() => set(i, "type", ty)}
+                  className={`px-3 py-2 text-sm font-semibold ${t.type === ty ? "bg-slate-900 text-white" : "bg-white text-slate-700"}`}>{ty}</button>
+              ))}
+            </div>
+            <input type="tel" className={selCls} value={t.numero} placeholder="06 12 34 56 78" onChange={(e) => set(i, "numero", e.target.value)} />
+            <button type="button" aria-label="Retirer ce numéro" onClick={() => onChange(tels.filter((_, j) => j !== i))}
+              className="shrink-0 rounded-md border border-slate-300 bg-white px-3 text-lg leading-none text-slate-500 hover:text-red-700">×</button>
+          </div>
+        ))}
+      </div>
+      <button type="button" className="mt-2 text-sm font-semibold text-slate-800 underline"
+        onClick={() => onChange([...tels, { type: tels.some((t) => t.type === "Mobile") ? "Fixe" : "Mobile", numero: "" }])}>
+        Ajouter un numéro
+      </button>
+    </div>
+  );
+}
+
 function ClientForm({ client, update, onDelete, used }) {
   const [confirm, setConfirm] = useState(false);
   const f = (k) => ({ value: client[k], onChange: (v) => update((c) => ({ ...c, [k]: v })) });
@@ -1001,7 +1039,7 @@ function ClientForm({ client, update, onDelete, used }) {
           <Field label="Adresse" className="sm:col-span-2" {...f("adresse")} />
           <Field label="Code postal" {...f("cp")} />
           <Field label="Ville" {...f("ville")} />
-          <Field label="Notes (accès, consignes du site…)" area className="sm:col-span-2" {...f("notes")} />
+          <Field label="Pays (laisser vide pour la France)" className="sm:col-span-2" {...f("pays")} />
         </div>
       </Section>
       <Section title="Contacts" hint="Les contacts avec un e-mail apparaissent comme destinataires à l'envoi des documents.">
@@ -1009,10 +1047,9 @@ function ClientForm({ client, update, onDelete, used }) {
           <div key={ct.id} className="rounded-md border border-slate-200 p-3">
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label="Nom, prénom" {...cf(i, "nom")} />
-              <Field label="Fonction" {...cf(i, "fonction")} />
               <Field label="E-mail" type="email" {...cf(i, "email")} />
-              <Field label="Téléphone" type="tel" {...cf(i, "tel")} />
             </div>
+            <PhonesEditor tels={ct.tels || []} onChange={(tels) => update((c) => setIn(c, ["contacts", i, "tels"], tels))} />
             {ct.email && !isEmail(ct.email) && <p className="mt-1 text-sm text-red-700">Adresse e-mail invalide.</p>}
             <button className="mt-2 text-xs font-semibold text-red-700 underline" onClick={() => update((c) => {
               const rest = c.contacts.filter((x) => x.id !== ct.id);
@@ -1181,7 +1218,7 @@ function MailDialog({ current, client, settings, getPdf, onClose, onSent }) {
           <div className="mb-2 space-y-0.5">
             {withMail.map((c) => (
               <Check key={c.id} checked={sel.has(c.email)} onChange={() => toggle(c.email)}>
-                {c.nom || c.email}{c.fonction ? ` — ${c.fonction}` : ""} <span className="text-slate-500">({c.email})</span>
+                {c.nom || c.email} <span className="text-slate-500">({c.email})</span>
               </Check>
             ))}
           </div>
@@ -1348,7 +1385,11 @@ export default function App() {
       if (withMigration && shared.length === 0) {
         // Migration unique : anciens clients de cette app → base commune (même id = même résultat si rejouée)
         const own = await getDocs(collection(db, CLI_COL));
-        const old = own.docs.map((d) => ({ id: d.id, nom: "", adresse: "", cp: "", ville: "", notes: "", ...d.data(), contacts: d.data().contacts || [] }));
+        const old = own.docs.map((d) => {
+          const v = d.data();
+          return { id: d.id, nom: v.nom || "", adresse: v.adresse || "", cp: v.cp || "", ville: v.ville || "", pays: "",
+            contacts: (v.contacts || []).map((x) => ({ id: x.id, nom: x.nom || "", email: x.email || "", tels: readTels(x) })) };
+        });
         if (old.length) {
           const flat = flattenClients(old);
           await syncContactsToShared(flat, []);
